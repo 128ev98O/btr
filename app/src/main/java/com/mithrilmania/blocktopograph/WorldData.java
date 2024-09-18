@@ -1,0 +1,341 @@
+package com.mithrilmania.blocktopograph;
+
+import android.annotation.SuppressLint;
+import android.util.LruCache;
+
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+
+import com.litl.leveldb.DB;
+import com.litl.leveldb.Iterator;
+import com.mithrilmania.blocktopograph.block.OldBlockRegistry;
+import com.mithrilmania.blocktopograph.chunk.Chunk;
+import com.mithrilmania.blocktopograph.chunk.ChunkTag;
+import com.mithrilmania.blocktopograph.chunk.Version;
+import com.mithrilmania.blocktopograph.map.Dimension;
+
+import java.io.File;
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * Wrapper around level.dat world spec en levelDB database.
+ */
+public class WorldData {
+    public DB db;
+
+    private final WeakReference<World> world;
+    private final LruCache<Key, Chunk> chunks = new ChunkCache(this, 256);
+    public final OldBlockRegistry mOldBlockRegistry;
+
+    public WorldData(World world) {
+        this.world = new WeakReference<>(world);
+        this.mOldBlockRegistry = new OldBlockRegistry(2048);
+    }
+
+    public ArrayList<byte[]> getStartsWith(byte[] key) {
+        ArrayList<byte[]> keyList = new ArrayList<>();
+        var it = db.iterator();
+        for (it.seekToFirst(); it.isValid(); it.next()) {
+            var dbkey = it.getKey();
+            assert dbkey != null;
+            if (key.length > dbkey.length) continue;
+            var cuttedKey = new byte[key.length - 1];
+            try {
+                System.arraycopy(dbkey, 0, cuttedKey, 0, key.length - 1);
+            } catch (Exception e) {
+                System.out.println("Error " + Arrays.toString(dbkey) + " " + Arrays.toString(key));
+                e.printStackTrace();
+            }
+
+            if (Arrays.equals(cuttedKey, key)) {
+                keyList.add(dbkey);
+            }
+        }
+        it.close();
+
+        Object[] sorted = keyList.toArray();
+
+        Arrays.sort(sorted);
+        var l = new ArrayList<byte[]>(sorted.length);
+        for (var v : sorted) {
+            l.add((byte[]) v);
+        }
+        return l;
+    }
+
+    public byte[] getChunkKeyData(byte[] key) {
+        ArrayList<byte[]> keys = getStartsWith(key);
+
+        int length = 0;
+
+        for (var k : keys) {
+            length += k.length;
+        }
+
+        var buffer = ByteBuffer.wrap(new byte[length]);
+        for (var k : keys) {
+            System.out.println((byte[]) k);
+            buffer.put(db.get((byte[]) k));
+        }
+        return length == 0 ? null : buffer.array();
+    }
+
+    @NonNull
+    public static byte[] getChunkDataKey(int x, int z, ChunkTag type, Dimension dimension) {
+        ByteBuffer buffer = ByteBuffer.wrap(new byte[8 + (dimension == Dimension.OVERWORLD ? 0 : 4) + 1]).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(x);
+        buffer.putInt(z);
+        if (dimension != Dimension.OVERWORLD) buffer.putInt(dimension.id);
+        buffer.put(type.dataID);
+        return buffer.array();
+    }
+
+    @NonNull
+    public static byte[] getChunkDataKey(int x, int z, ChunkTag type, Dimension dimension, byte subchunkId) {
+        ByteBuffer buffer = ByteBuffer.wrap(new byte[8 + (dimension == Dimension.OVERWORLD ? 0 : 4) + 1 + 1]).order(ByteOrder.LITTLE_ENDIAN);
+        buffer.putInt(x);
+        buffer.putInt(z);
+        if (dimension != Dimension.OVERWORLD) buffer.putInt(dimension.id);
+        buffer.put(type.dataID);
+        buffer.put(subchunkId);
+        return buffer.array();
+    }
+
+    private static byte[] getReversedBytes(int i) {
+        return new byte[]{
+                (byte) i,
+                (byte) (i >> 8),
+                (byte) (i >> 16),
+                (byte) (i >> 24)
+        };
+    }
+
+    //load db when needed (does not load it!)
+    @SuppressLint({"SetWorldReadable", "SetWorldWritable"})
+    public void load() throws WorldDataLoadException {
+        if (db != null) return;
+
+        World world = this.world.get();
+
+        File dbFile = new File(world.worldFolder, "db");
+        if (!dbFile.canRead()) {
+            if (!dbFile.setReadable(true, false))
+                throw new WorldDataLoadException("World-db folder is not readable! World-db folder: " + dbFile.getAbsolutePath());
+        }
+        if (!dbFile.canWrite()) {
+            if (!dbFile.setWritable(true, false))
+                throw new WorldDataLoadException("World-db folder is not writable! World-db folder: " + dbFile.getAbsolutePath());
+        }
+
+        if (dbFile.listFiles() == null)
+            throw new WorldDataLoadException("Failed loading world-db: cannot list files in worldfolder");
+
+        this.db = new DB(dbFile);
+    }
+
+    //open db to make it available for this app
+    public void openDB() throws WorldDBException {
+        if (this.db == null)
+            throw new WorldDBException("DB is null!!! (db is not loaded probably)");
+
+        if (this.db.isClosed()) {
+            try {
+                this.db.open();
+            } catch (Exception e) {
+
+                throw new WorldDBException("DB could not be opened! " + e.getMessage());
+            }
+        }
+
+    }
+
+    //close db to make it available for other apps (Minecraft itself!)
+    public void closeDB() throws WorldDBException {
+        if (this.db == null)
+            return;
+        //Why bother throw an exception, isn't it good enough being able to skip closing as it's null?
+        try {
+            this.db.close();
+        } catch (Exception e) {
+            //db was already closed (probably)
+            e.printStackTrace();
+        }
+    }
+
+    public byte[] getChunkData(int x, int z, ChunkTag type, Dimension dimension) throws WorldDBException, WorldDBLoadException {
+
+        //ensure that the db is opened
+        this.openDB();
+
+        byte[] chunkKey = getChunkDataKey(x, z, type, dimension);
+        return getChunkKeyData(chunkKey);
+    }
+
+    public byte[] getChunkData(int x, int z, ChunkTag type, Dimension dimension, byte subchunkId) throws WorldDBException, WorldDBLoadException {
+
+        //ensure that the db is opened
+        this.openDB();
+
+        byte[] chunkKey = getChunkDataKey(x, z, type, dimension, subchunkId);
+        return getChunkKeyData(chunkKey);
+    }
+
+    public void writeChunkData(int x, int z, ChunkTag type, Dimension dimension, byte[] chunkData) throws WorldDBException {
+        //ensure that the db is opened
+        this.openDB();
+
+        db.put(getChunkDataKey(x, z, type, dimension), chunkData);
+    }
+
+    public void removeChunkData(int x, int z, ChunkTag type, Dimension dimension) throws WorldDBException {
+        //ensure that the db is opened
+        this.openDB();
+
+        db.delete(getChunkDataKey(x, z, type, dimension));
+    }
+
+    public void removeFullChunk(int x, int z, Dimension dimension) {
+        var it = db.iterator();
+        var compareKey = getChunkDataKey(x, z, ChunkTag.DATA_2D, dimension);
+        int baseKeyLength = dimension == Dimension.OVERWORLD ? 8 : 12;
+        for (it.seekToFirst(); it.isValid(); it.next()) {
+            byte[] key = it.getKey();
+            boolean allMatched = false;
+            for (var i = 0; i < baseKeyLength; i++) {
+                if (key[i] == compareKey[i]) {
+                    if (i == baseKeyLength - 1) allMatched = true;
+                } else {
+                    break;
+                }
+            }
+            if (key.length > baseKeyLength && key.length <= baseKeyLength + 3 && allMatched)
+                db.delete(key);
+        }
+        it.close();
+    }
+
+    public Chunk getChunk(int cX, int cZ, Dimension dimension, boolean createIfMissing, Version createOfVersion) {
+        Key key = new Key(cX, cZ, dimension);
+        key.createIfMissng = createIfMissing;
+        key.createOfVersion = createOfVersion;
+        return chunks.get(key);
+    }
+
+    public Chunk getChunk(int cX, int cZ, Dimension dimension) {
+        Key key = new Key(cX, cZ, dimension);
+        return chunks.get(key);
+    }
+
+    // Avoid using cache for stream like operations.
+    // Caller shall lock cache before operation and invalidate cache afterwards.
+    public Chunk getChunkStreaming(int cx, int cz, Dimension dimension, boolean createIfMissing, Version createOfVersion) {
+        return Chunk.create(this, cx, cz, dimension, createIfMissing, createOfVersion);
+    }
+
+    public void resetCache() {
+        this.chunks.evictAll();
+    }
+
+    public String[] getNetworkPlayerNames() {
+        List<String> players = getDBKeysStartingWith("player_");
+        return players.toArray(new String[0]);
+    }
+
+    public List<String> getDBKeysStartingWith(String startWith) {
+        Iterator it = db.iterator();
+
+        ArrayList<String> items = new ArrayList<>();
+        for (it.seekToFirst(); it.isValid(); it.next()) {
+            byte[] key = it.getKey();
+            if (key == null) continue;
+            String keyStr = new String(key);
+            if (keyStr.startsWith(startWith)) items.add(keyStr);
+        }
+        it.close();
+
+        return items;
+    }
+
+    private static class ChunkCache extends LruCache<Key, Chunk> {
+
+        private final WeakReference<WorldData> worldData;
+
+        ChunkCache(WorldData worldData, int maxSize) {
+            super(maxSize);
+            this.worldData = new WeakReference<>(worldData);
+        }
+
+        @Override
+        protected void entryRemoved(boolean evicted, Key key, Chunk oldValue, Chunk newValue) {
+            try {
+                oldValue.save();
+            } catch (Exception e) {
+                Log.d(this, e);
+            }
+        }
+
+        @Nullable
+        @Override
+        protected Chunk create(Key key) {
+            WorldData worldData = this.worldData.get();
+            if (worldData == null) return null;
+            return Chunk.create(worldData, key.x, key.z, key.dim, key.createIfMissng, key.createOfVersion);
+        }
+    }
+
+    static class Key {
+
+        public int x, z;
+        public Dimension dim;
+        public boolean createIfMissng;
+        public Version createOfVersion;
+
+        Key(int x, int z, Dimension dim) {
+            this.x = x;
+            this.z = z;
+            this.dim = dim;
+        }
+
+        @Override
+        public int hashCode() {
+            return (x * 31 + z) * 31 + dim.id;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof Key)) return false;
+            Key another = (Key) obj;
+            return ((x == another.x) && (z == another.z) && (dim != null)
+                    && (another.dim != null) && (dim.id == another.dim.id));
+        }
+    }
+
+    public static class WorldDataLoadException extends Exception {
+        private static final long serialVersionUID = 659185044124115547L;
+
+        public WorldDataLoadException(String msg) {
+            super(msg);
+        }
+    }
+
+    public static class WorldDBException extends Exception {
+        private static final long serialVersionUID = -3299282170140961220L;
+
+        public WorldDBException(String msg) {
+            super(msg);
+        }
+    }
+
+    public static class WorldDBLoadException extends Exception {
+        private static final long serialVersionUID = 4412238820886423076L;
+
+        public WorldDBLoadException(String msg) {
+            super(msg);
+        }
+    }
+}
